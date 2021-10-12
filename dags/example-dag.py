@@ -1,74 +1,132 @@
-from airflow import DAG
-from airflow.operators.dummy_operator import DummyOperator
-from airflow.operators.bash_operator import BashOperator
-from airflow.operators.python_operator import PythonOperator
-from airflow.version import version
 from datetime import datetime, timedelta
+from typing import Dict
+
+from airflow.decorators import task
+from airflow.models import DAG
+from airflow.models.baseoperator import chain
+from airflow.operators.bash import BashOperator
+from airflow.operators.dummy import DummyOperator
+from airflow.operators.email import EmailOperator
+from airflow.operators.python import BranchPythonOperator
+from airflow.operators.weekday import BranchDayOfWeekOperator
+from airflow.utils.edgemodifier import Label
+from airflow.utils.task_group import TaskGroup
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.utils.weekday import WeekDay
 
 from uneven_intervals import UnevenIntervalsTimetable
 
 
-def my_custom_function(ts,**kwargs):
-    """
-    This can be any python code you want and is called from the python operator. The code is not executed until
-    the task is run by the airflow scheduler.
-    """
-    print(f"I am task number {kwargs['task_number']}. This DAG Run execution date is {ts} and the current time is {datetime.now()}")
-    print('Here is the full DAG Run context. It is available because provide_context=True')
-    print(kwargs)
+"""
+Example DAG to show use of custom timetable.
+"""
 
-
-# Default settings applied to all tasks
-default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5)
+# Reference data for determining the activity to perform per day of week.
+DAY_ACTIVITY_MAPPING = {
+    "monday": {"is_weekday": True, "activity": "guitar lessons"},
+    "tuesday": {"is_weekday": True, "activity": "studying"},
+    "wednesday": {"is_weekday": True, "activity": "soccer practice"},
+    "thursday": {"is_weekday": True, "activity": "contributing to Airflow"},
+    "friday": {"is_weekday": True, "activity": "family dinner"},
+    "saturday": {"is_weekday": False, "activity": "going to the beach"},
+    "sunday": {"is_weekday": False, "activity": "sleeping in"},
 }
 
-# Using a DAG context manager, you don't have to specify the dag property of each task
-with DAG('example_dag',
-         start_date=datetime(2021, 10, 9),
-         max_active_runs=1,
-         timetable=UnevenIntervalsTimetable(),
-         default_args=default_args,
-         catchup=True # enable if you don't want historical dag runs to run
-         ) as dag:
 
-    t0 = DummyOperator(
-        task_id='start'
+@task(multiple_outputs=True)
+def going_to_the_beach() -> Dict:
+    return {
+        "subject": "Beach day!",
+        "body": "It's Saturday and I'm heading to the beach.<br><br>Come join me!<br>",
+    }
+
+
+def _get_activity(day_name) -> str:
+    activity_id = DAY_ACTIVITY_MAPPING[day_name]["activity"].replace(" ", "_")
+
+    if DAY_ACTIVITY_MAPPING[day_name]["is_weekday"]:
+        return f"weekday_activities.{activity_id}"
+
+    return f"weekend_activities.{activity_id}"
+
+
+with DAG(
+    dag_id="example_timetable_dag",
+    start_date=datetime(2021, 10, 9), 
+    max_active_runs=1,
+    timetable=UnevenIntervalsTimetable(),
+    default_args={
+        "retries": 1,
+        "retry_delay": timedelta(minutes=3),
+    },
+    catchup=True
+) as dag:
+
+    begin = DummyOperator(task_id="begin")
+    end = DummyOperator(task_id="end", trigger_rule=TriggerRule.NONE_FAILED)
+
+    check_day_of_week = BranchDayOfWeekOperator(
+        task_id="check_day_of_week",
+        week_day={WeekDay.SATURDAY, WeekDay.SUNDAY},
+        follow_task_ids_if_true="weekend",
+        follow_task_ids_if_false="weekday",
+        use_task_execution_day=True,
     )
 
-    t1 = DummyOperator(
-        task_id='group_bash_tasks'
-    )
-    t2 = BashOperator(
-        task_id='bash_print_date1',
-        bash_command='sleep $[ ( $RANDOM % 30 )  + 1 ]s && date')
-    t3 = BashOperator(
-        task_id='bash_print_date2',
-        bash_command='sleep $[ ( $RANDOM % 30 )  + 1 ]s && date')
+    weekend = DummyOperator(task_id="weekend")
+    weekday = DummyOperator(task_id="weekday")
 
-    # generate tasks with a loop. task_id must be unique
-    for task in range(5):
-        if version.startswith('2'):
-            tn = PythonOperator(
-                task_id=f'python_print_date_{task}',
-                python_callable=my_custom_function,  # make sure you don't include the () of the function
-                op_kwargs={'task_number': task},
-            )
-        else:
-            tn = PythonOperator(
-                task_id=f'python_print_date_{task}',
-                python_callable=my_custom_function,  # make sure you don't include the () of the function
-                op_kwargs={'task_number': task},
-                provide_context=True,
-            )
+    # Templated value for determining the name of the day of week based on the start date of the DagRun.
+    day_name = "{{ dag_run.start_date.strftime('%A').lower() }}"
 
+    # Begin weekday tasks.
+    with TaskGroup("weekday_activities") as weekday_activities:
+        which_weekday_activity_day = BranchPythonOperator(
+            task_id="which_weekday_activity_day",
+            python_callable=_get_activity,
+            op_args=[day_name],
+        )
 
-        t0 >> tn # indented inside for loop so each task is added downstream of t0
+        for day, day_info in DAY_ACTIVITY_MAPPING.items():
+            if day_info["is_weekday"]:
+                day_of_week = Label(label=day)
+                activity = day_info["activity"]
 
-    t0 >> t1
-    t1 >> [t2, t3] # lists can be used to specify multiple tasks
+                do_activity = BashOperator(
+                    task_id=activity.replace(" ", "_"),
+                    bash_command=f"echo It's {day.capitalize()} and I'm busy with {activity}.",
+                )
+
+                # Declaring task dependencies within the `TaskGroup` via the classic bitshift operator.
+                which_weekday_activity_day >> day_of_week >> do_activity
+
+    # Begin weekend tasks.
+    with TaskGroup("weekend_activities") as weekend_activities:
+        which_weekend_activity_day = BranchPythonOperator(
+            task_id="which_weekend_activity_day",
+            python_callable=_get_activity,
+            op_args=[day_name],
+        )
+
+        saturday = Label(label="saturday")
+        sunday = Label(label="sunday")
+
+        sleeping_in = BashOperator(task_id="sleeping_in", bash_command="sleep $[ ( $RANDOM % 30 )  + 1 ]s")
+
+        going_to_the_beach = going_to_the_beach()
+
+        # Because the ``going_to_the_beach()`` function has ``multiple_outputs`` enabled, each dict key is
+        # accessible as their own `XCom` key.
+        inviting_friends = EmailOperator(
+            task_id="inviting_friends",
+            to="friends@community.com",
+            subject=going_to_the_beach["subject"],
+            html_content=going_to_the_beach["body"],
+        )
+
+        # Using ``chain()`` here for list-to-list dependencies which are not supported by the bitshift
+        # operator and to simplify the notation for the desired dependency structure.
+        chain(which_weekend_activity_day, [saturday, sunday], [going_to_the_beach, sleeping_in])
+
+    # High-level dependencies.
+    chain(begin, check_day_of_week, [weekday, weekend], [weekday_activities, weekend_activities], end)
