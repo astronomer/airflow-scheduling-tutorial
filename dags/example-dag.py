@@ -5,7 +5,7 @@ from airflow.operators.python_operator import PythonOperator
 from airflow.version import version
 from datetime import datetime, timedelta
 
-from end_of_month_timetable import EndOfMonthTimetable
+from uneven_intervals import UnevenIntervalsTimetable
 
 
 def my_custom_function(ts,**kwargs):
@@ -30,9 +30,9 @@ default_args = {
 
 # Using a DAG context manager, you don't have to specify the dag property of each task
 with DAG('example_dag',
-         start_date=datetime(2021, 9, 1),
+         start_date=datetime(2021, 10, 9),
          max_active_runs=1,
-         timetable=EndOfMonthTimetable(),
+         timetable=UnevenIntervalsTimetable(),
          default_args=default_args,
          catchup=True # enable if you don't want historical dag runs to run
          ) as dag:
