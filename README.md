@@ -1,6 +1,6 @@
 # airflow-scheduling-tutorial
 
-This repo contains an example Airflow project for implementing custom timetables with Airflow 2.2. A full guide walking through the timetables concept will be published shortly.
+This repo contains an example Airflow project for implementing custom timetables with Airflow 2.2. A full guide walking through the timetables concept can be found [here](https://www.astronomer.io/guides/scheduling-in-airflow).
 
 There are two example timetables in the `plugins/` directory of this repo:
 
